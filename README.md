@@ -10,6 +10,7 @@
   - **目录快照**：每次生成一份完整目录，未变化的文件与上一份硬链接，只占用变化文件的空间（类似 Time Machine）
   - **ZIP 压缩包**：每次生成一个 zip
 - 自动清理超出保留份数的旧备份
+- 备份完成后可自动上传到 **腾讯云 COS 存储桶**（零依赖，内置 COS 签名）
 - 立即备份、暂停/启用、查看最近状态，日志写入 `~/.backup_tool/backup.log`
 - macOS 可一键设置登录后自动在后台运行
 
@@ -33,6 +34,23 @@ python3 backup_tool.py install-autostart     # macOS：登录后自动后台运�
 python3 backup_tool.py uninstall-autostart   # macOS：取消自动运行
 ```
 
+## 上传到腾讯云 COS
+
+1. 在 [访问管理 → API 密钥](https://console.cloud.tencent.com/cam/capi) 获取 SecretId / SecretKey（建议使用只授权目标存储桶读写的子账号）
+2. 打开管理界面底部「腾讯云 COS 设置」，填写密钥、存储桶名称（如 `examplebucket-1250000000`）、地域（如 `ap-shanghai`）和可选的路径前缀，保存后点「测试连接」
+3. 编辑任务，勾选「备份后上传到腾讯云 COS」
+
+密钥也可以不写入配置，改用环境变量 `COS_SECRET_ID` / `COS_SECRET_KEY` 提供。
+
+上传规则：
+
+| 备份方式 | COS 上的位置 | 说明 |
+| --- | --- | --- |
+| ZIP 压缩包 | `<前缀>/<任务名>-<任务ID>/<时间>.zip` | 远端与本地一样只保留最近 N 份 |
+| 目录快照 | `<前缀>/<任务名>-<任务ID>/latest/...` | 把最新快照增量同步过去：只上传有变化的文件，删除源目录已删的文件。如需远端保留历史版本，可在存储桶开启「版本控制」 |
+
+上传失败时任务状态显示为失败并给出原因，本地备份不受影响，下个周期会自动重试（目录快照模式会从中断处续传）。
+
 ## 备份目录结构
 
 ```
@@ -43,7 +61,7 @@ python3 backup_tool.py uninstall-autostart   # macOS：取消自动运行
 
 ## 说明
 
-- 配置保存在 `~/.backup_tool/config.json`，可用环境变量 `BACKUP_TOOL_HOME` 修改
+- 配置保存在 `~/.backup_tool/config.json`（权限 600），可用环境变量 `BACKUP_TOOL_HOME` 修改
 - 服务只监听 `127.0.0.1`，并拒绝跨站请求
 - 目标目录位于源目录内时会自动跳过，避免递归备份
 - 符号链接不会被备份

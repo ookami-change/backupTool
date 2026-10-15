@@ -6,13 +6,18 @@
     python3 backup_tool.py --no-browser    仅启动服务
     python3 backup_tool.py run-once        立即执行所有已启用任务后退出
     python3 backup_tool.py install-autostart / uninstall-autostart   (macOS) 登录时自动启动
+
+可选：备份完成后上传到腾讯云 COS 存储桶（在管理界面「腾讯云 COS 设置」中配置）。
 """
 import argparse
 import fnmatch
+import hashlib
+import hmac
 import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +25,10 @@ import threading
 import time
 import uuid
 import webbrowser
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +40,7 @@ LOG_FILE = APP_DIR / "backup.log"
 DEFAULT_PORT = 8765
 TS_FORMAT = "%Y%m%d-%H%M%S"
 LAUNCHD_LABEL = "com.backuptool.agent"
+COS_FIELDS = ("secret_id", "secret_key", "bucket", "region", "prefix")
 
 log = logging.getLogger("backup_tool")
 
@@ -44,19 +54,48 @@ class Store:
         self.path = Path(path)
         self.lock = threading.RLock()
         self.tasks = []
+        self.cos = {}
         self.load()
 
     def load(self):
         with self.lock:
             if self.path.exists():
-                self.tasks = json.loads(self.path.read_text("utf-8")).get("tasks", [])
+                data = json.loads(self.path.read_text("utf-8"))
+                self.tasks = data.get("tasks", [])
+                self.cos = data.get("cos", {})
 
     def save(self):
         with self.lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"tasks": self.tasks}, ensure_ascii=False, indent=2), "utf-8")
+            tmp.write_text(json.dumps({"tasks": self.tasks, "cos": self.cos},
+                                      ensure_ascii=False, indent=2), "utf-8")
+            os.chmod(tmp, 0o600)  # 含 COS 密钥，仅本人可读
             tmp.replace(self.path)
+
+    def cos_config(self):
+        """实际生效的 COS 配置，密钥可由环境变量 COS_SECRET_ID / COS_SECRET_KEY 提供。"""
+        with self.lock:
+            cfg = dict(self.cos)
+        cfg["secret_id"] = cfg.get("secret_id") or os.environ.get("COS_SECRET_ID", "")
+        cfg["secret_key"] = cfg.get("secret_key") or os.environ.get("COS_SECRET_KEY", "")
+        return cfg
+
+    def public_cos(self):
+        """给界面展示的配置，不回传密钥。"""
+        cfg = self.cos_config()
+        return {"secret_id": cfg["secret_id"], "has_secret_key": bool(cfg["secret_key"]),
+                "bucket": cfg.get("bucket", ""), "region": cfg.get("region", ""),
+                "prefix": cfg.get("prefix", ""), "configured": cos_configured(cfg)}
+
+    def set_cos(self, data):
+        cfg = {k: str(data.get(k) or "").strip() for k in COS_FIELDS}
+        cfg["prefix"] = cfg["prefix"].strip("/")
+        with self.lock:
+            if not cfg["secret_key"]:  # 留空表示不修改已保存的密钥
+                cfg["secret_key"] = self.cos.get("secret_key", "")
+            self.cos = cfg
+            self.save()
 
     def get(self, task_id):
         with self.lock:
@@ -124,6 +163,7 @@ def validate_task(data):
         "mode": mode,
         "excludes": ",".join(p.strip() for p in str(excludes).split(",") if p.strip()),
         "enabled": bool(data.get("enabled", True)),
+        "upload_cos": bool(data.get("upload_cos", False)),
     }
 
 
@@ -203,7 +243,7 @@ def run_backup(task):
     if task["mode"] == "zip":
         out = root / f"{name}.zip"
         tmp = root / f".{name}.zip.part"
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as zf:
             for full, rel in iter_files(source, patterns, skip):
                 zf.write(full, rel.as_posix())
                 total += 1
@@ -247,6 +287,147 @@ def prune(task):
             old.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------- tencent cos
+
+def cos_configured(cfg):
+    return all(cfg.get(k) for k in ("secret_id", "secret_key", "bucket", "region"))
+
+
+def _cos_quote(s):
+    return urllib.parse.quote(str(s), safe="-_.~")
+
+
+def _xml_find(el, name):
+    return [c for c in el.iter() if c.tag.split("}")[-1] == name]
+
+
+class CosClient:
+    """腾讯云 COS XML API 的最小实现。
+
+    签名算法见 https://cloud.tencent.com/document/product/436/7778
+    """
+
+    def __init__(self, cfg, timeout=120):
+        self.secret_id = cfg["secret_id"]
+        self.secret_key = cfg["secret_key"]
+        self.host = f"{cfg['bucket']}.cos.{cfg['region']}.myqcloud.com"
+        self.endpoint = cfg.get("endpoint") or f"https://{self.host}"
+        self.timeout = timeout
+
+    def _authorization(self, method, path, params, headers):
+        now = int(time.time())
+        key_time = f"{now - 60};{now + 3600}"
+        sign_key = hmac.new(self.secret_key.encode(), key_time.encode(), hashlib.sha1).hexdigest()
+
+        def fmt(d):
+            items = sorted((_cos_quote(k).lower(), _cos_quote(v)) for k, v in d.items())
+            return ";".join(k for k, _ in items), "&".join(f"{k}={v}" for k, v in items)
+
+        param_list, param_str = fmt(params)
+        header_list, header_str = fmt(headers)
+        http_string = f"{method.lower()}\n{path}\n{param_str}\n{header_str}\n"
+        string_to_sign = f"sha1\n{key_time}\n{hashlib.sha1(http_string.encode()).hexdigest()}\n"
+        signature = hmac.new(sign_key.encode(), string_to_sign.encode(), hashlib.sha1).hexdigest()
+        return (f"q-sign-algorithm=sha1&q-ak={self.secret_id}&q-sign-time={key_time}"
+                f"&q-key-time={key_time}&q-header-list={header_list}"
+                f"&q-url-param-list={param_list}&q-signature={signature}")
+
+    def request(self, method, key="", params=None, data=None, length=None):
+        params = {k: str(v) for k, v in (params or {}).items()}
+        path = "/" + key
+        url = self.endpoint + urllib.parse.quote(path, safe="/-_.~")
+        if params:
+            url += "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", self._authorization(method, path, params, {"host": self.host}))
+        if length is not None:
+            req.add_header("Content-Length", str(length))
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")
+            code = re.search(r"<Code>(.*?)</Code>", body)
+            raise RuntimeError(f"COS {method} /{key} 失败: HTTP {e.code} "
+                               f"{code.group(1) if code else body[:200]}") from None
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"无法连接 COS ({self.host}): {e.reason}") from None
+
+    def put_file(self, key, path):
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            self.request("PUT", key, data=f if size else b"", length=size)
+
+    def delete(self, key):
+        self.request("DELETE", key)
+
+    def list_keys(self, prefix, limit=None):
+        keys, marker = [], ""
+        while True:
+            params = {"prefix": prefix, "max-keys": limit or 1000}
+            if marker:
+                params["marker"] = marker
+            root = ET.fromstring(self.request("GET", "", params))
+            page = [k.text or "" for c in _xml_find(root, "Contents") for k in _xml_find(c, "Key")]
+            keys.extend(page)
+            truncated = [t.text for t in _xml_find(root, "IsTruncated")]
+            if limit or not page or truncated[:1] != ["true"]:
+                return keys
+            nxt = [t.text for t in _xml_find(root, "NextMarker")]
+            marker = nxt[0] if nxt and nxt[0] else page[-1]
+
+
+def cos_remote_root(cfg, task):
+    parts = [cfg.get("prefix", "").strip("/"), task_backup_root(task).name]
+    return "/".join(p for p in parts if p) + "/"
+
+
+def upload_to_cos(cfg, task, out):
+    """把本次备份上传到 COS，返回结果描述。
+
+    zip 模式: 上传压缩包，远端同样只保留最近 keep 份。
+    snapshot 模式: 把最新快照增量同步到 <前缀>/<任务>/latest/，只传有变化的文件并删除已不存在的文件。
+    """
+    client = CosClient(cfg)
+    remote = cos_remote_root(cfg, task)
+    if out.is_file():
+        client.put_file(remote + out.name, out)
+        zips = sorted((k for k in client.list_keys(remote)
+                       if k.endswith(".zip") and "/" not in k[len(remote):]),
+                      key=lambda k: _backup_sort_key(Path(k)))
+        removed = zips[:-task["keep"]] if len(zips) > task["keep"] else []
+        for k in removed:
+            client.delete(k)
+        return f"已上传 COS：{remote}{out.name}" + (f"，清理远端旧备份 {len(removed)} 个" if removed else "")
+
+    latest = remote + "latest/"
+    manifest_file = task_backup_root(task) / ".cos_manifest.json"
+    target = f"{cfg['bucket']}/{latest}"
+    manifest = {}
+    if manifest_file.exists():
+        saved = json.loads(manifest_file.read_text("utf-8"))
+        if saved.get("target") == target:
+            manifest = saved.get("files", {})
+    files = {rel.as_posix(): full for full, rel in iter_files(out, [])}
+    uploaded = deleted = 0
+    try:
+        for rel, full in files.items():
+            st = full.stat()
+            sig = [st.st_size, int(st.st_mtime)]
+            if manifest.get(rel) == sig:
+                continue
+            client.put_file(latest + rel, full)
+            manifest[rel] = sig
+            uploaded += 1
+        for rel in [r for r in manifest if r not in files]:
+            client.delete(latest + rel)
+            manifest.pop(rel)
+            deleted += 1
+    finally:  # 中途失败也记录已上传的部分，下次续传
+        manifest_file.write_text(json.dumps({"target": target, "files": manifest}), "utf-8")
+    return f"COS 同步到 {latest}：上传 {uploaded} 个，删除 {deleted} 个"
+
+
 # ---------------------------------------------------------------- scheduler
 
 class Scheduler:
@@ -286,6 +467,14 @@ class Scheduler:
             log.info("[%s] 开始备份 %s -> %s", task["name"], task["source"], task["dest"])
             total, copied, out = run_backup(task)
             msg = f"{total} 个文件，新复制 {copied} 个，耗时 {time.time() - started:.1f}s -> {out.name}"
+            if task.get("upload_cos"):
+                cfg = self.store.cos_config()
+                if not cos_configured(cfg):
+                    raise RuntimeError(f"本地备份完成（{msg}），但尚未配置腾讯云 COS")
+                try:
+                    msg += "；" + upload_to_cos(cfg, task, out)
+                except Exception as e:
+                    raise RuntimeError(f"本地备份完成（{msg}），上传 COS 失败: {e}") from e
             log.info("[%s] 备份完成：%s", task["name"], msg)
             self.store.update_status(task_id, last_status="ok", last_message=msg)
         except Exception as e:  # noqa: BLE001 - 记录任何失败
@@ -373,9 +562,23 @@ button:disabled{opacity:.5;cursor:default}.actions{display:flex;gap:8px;margin-t
 <div><label>排除（逗号分隔）</label><input id="excludes" placeholder=".git,node_modules,*.tmp"></div>
 </div>
 <div class="check"><input type="checkbox" id="enabled" checked><span>启用定时备份</span></div>
+<div class="check"><input type="checkbox" id="upload_cos"><span>备份后上传到腾讯云 COS <span class="meta" id="cosHint"></span></span></div>
 <div class="actions"><button class="primary" type="submit">保存</button><button type="button" onclick="resetForm()">清空</button></div>
 </form></div>
-<div id="list"></div></div><div id="toast"></div>
+<div id="list"></div>
+<details class="card" id="cosCard"><summary style="cursor:pointer;font-size:16px;font-weight:600">腾讯云 COS 设置 <span class="badge" id="cosState">未配置</span></summary>
+<form id="cosForm">
+<div class="meta" style="margin-top:8px">密钥在 <a href="https://console.cloud.tencent.com/cam/capi" target="_blank">访问管理 → API 密钥</a> 获取，建议使用只授权该存储桶的子账号密钥。密钥只保存在本机 ~/.backup_tool/config.json。</div>
+<div class="grid" style="grid-template-columns:1fr 1fr">
+<div><label>SecretId</label><input id="cos_secret_id" autocomplete="off"></div>
+<div><label>SecretKey</label><input id="cos_secret_key" type="password" autocomplete="new-password"></div>
+<div><label>存储桶名称（含 APPID）</label><input id="cos_bucket" placeholder="examplebucket-1250000000"></div>
+<div><label>所属地域</label><input id="cos_region" placeholder="ap-shanghai"></div>
+</div>
+<label>路径前缀（可选）</label><input id="cos_prefix" placeholder="backups">
+<div class="actions"><button class="primary" type="submit">保存</button><button type="button" onclick="testCos()">测试连接</button></div>
+</form></details>
+</div><div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);const F=['name','source','dest','interval_minutes','keep','mode','excludes'];
 function toast(t){const e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(e._t);e._t=setTimeout(()=>e.style.display='none',2500)}
@@ -389,19 +592,26 @@ function render(){$('list').innerHTML=tasks.length?tasks.map(t=>{
  const next=t.enabled?(t.next_run?'下次：'+t.next_run.replace('T',' '):'即将执行'):'已暂停';
  return `<div class="card task"><div style="flex:1;min-width:260px"><h3>${esc(t.name)}${st}</h3>
  <div class="meta">${esc(t.source)} → ${esc(t.dest)}</div>
- <div class="meta">每 ${t.interval_minutes} 分钟 · 保留 ${t.keep} 份 · ${t.mode==='zip'?'ZIP':'快照'} · 已有 ${t.backup_count} 份 · 上次：${t.last_run?t.last_run.replace('T',' '):'从未'} · ${next}</div>
+ <div class="meta">每 ${t.interval_minutes} 分钟 · 保留 ${t.keep} 份 · ${t.mode==='zip'?'ZIP':'快照'} · 已有 ${t.backup_count} 份${t.upload_cos?' · 上传 COS':''} · 上次：${t.last_run?t.last_run.replace('T',' '):'从未'} · ${next}</div>
  ${t.last_message?`<div class="msg ${t.last_status}">${esc(t.last_message)}</div>`:''}</div>
  <div class="actions" style="margin:0"><button class="primary" ${t.running?'disabled':''} onclick="run('${t.id}')">立即备份</button>
  <button onclick="openDir('${t.id}')">打开</button><button onclick="edit('${t.id}')">编辑</button>
  <button class="danger" onclick="del('${t.id}')">删除</button></div></div>`}).join(''):'<div class="card meta">还没有备份任务</div>'}
-function edit(id){const t=tasks.find(x=>x.id===id);$('tid').value=id;F.forEach(f=>$(f).value=t[f]);$('enabled').checked=t.enabled;$('formTitle').textContent='编辑任务：'+t.name;scrollTo(0,0)}
+function edit(id){const t=tasks.find(x=>x.id===id);$('tid').value=id;F.forEach(f=>$(f).value=t[f]);$('enabled').checked=t.enabled;$('upload_cos').checked=!!t.upload_cos;$('formTitle').textContent='编辑任务：'+t.name;scrollTo(0,0)}
 function resetForm(){$('form').reset();$('tid').value='';$('formTitle').textContent='新建备份任务'}
-$('form').onsubmit=async e=>{e.preventDefault();const body={enabled:$('enabled').checked};F.forEach(f=>body[f]=$(f).value);const id=$('tid').value;
+$('form').onsubmit=async e=>{e.preventDefault();const body={enabled:$('enabled').checked,upload_cos:$('upload_cos').checked};F.forEach(f=>body[f]=$(f).value);const id=$('tid').value;
  try{await api(id?'/api/tasks/'+id:'/api/tasks',{method:id?'PUT':'POST',body:JSON.stringify(body)});toast('已保存');resetForm();load()}catch(err){toast(err.message)}}
 async function run(id){try{await api(`/api/tasks/${id}/run`,{method:'POST'});toast('已开始备份');setTimeout(load,500)}catch(e){toast(e.message)}}
 async function openDir(id){try{await api(`/api/tasks/${id}/open`,{method:'POST'})}catch(e){toast(e.message)}}
 async function del(id){if(!confirm('删除任务？（已有备份文件不会被删除）'))return;await api('/api/tasks/'+id,{method:'DELETE'});load()}
-load();setInterval(load,3000);
+const C=['secret_id','bucket','region','prefix'];
+async function loadCos(){const c=await api('/api/cos');C.forEach(f=>$('cos_'+f).value=c[f]);$('cos_secret_key').value='';
+ $('cos_secret_key').placeholder=c.has_secret_key?'已保存，留空则不修改':'';$('cosState').textContent=c.configured?c.bucket:'未配置';
+ $('cosState').className='badge'+(c.configured?' ok':'');$('cosHint').textContent=c.configured?'':'（请先在页面底部配置 COS）'}
+$('cosForm').onsubmit=async e=>{e.preventDefault();const body={secret_key:$('cos_secret_key').value};C.forEach(f=>body[f]=$('cos_'+f).value);
+ try{await api('/api/cos',{method:'POST',body:JSON.stringify(body)});toast('COS 设置已保存');loadCos()}catch(err){toast(err.message)}}
+async function testCos(){toast('正在连接…');try{await api('/api/cos/test',{method:'POST'});toast('连接成功')}catch(e){toast(e.message)}}
+load();loadCos();setInterval(load,3000);
 </script></body></html>"""
 
 
@@ -451,6 +661,8 @@ def make_handler(store, scheduler):
                         nxt = datetime.fromisoformat(t["last_run"]).timestamp() + t["interval_minutes"] * 60
                         t["next_run"] = datetime.fromtimestamp(nxt).isoformat(timespec="seconds")
                 self._json(200, {"tasks": tasks})
+            elif parts == ["api", "cos"]:
+                self._json(200, store.public_cos())
             else:
                 self._json(404, {"error": "not found"})
 
@@ -461,6 +673,18 @@ def make_handler(store, scheduler):
             try:
                 if parts == ["api", "tasks"]:
                     self._json(200, store.upsert(self._body()))
+                elif parts == ["api", "cos"]:
+                    store.set_cos(self._body())
+                    self._json(200, store.public_cos())
+                elif parts == ["api", "cos", "test"]:
+                    cfg = store.cos_config()
+                    if not cos_configured(cfg):
+                        raise ValueError("请先填写并保存 SecretId、SecretKey、存储桶和地域")
+                    try:
+                        CosClient(cfg, timeout=15).list_keys(cfg.get("prefix", ""), limit=1)
+                    except RuntimeError as e:
+                        raise ValueError(str(e)) from None
+                    self._json(200, {"ok": True})
                 elif parts == ["api", "pick-folder"]:
                     self._json(200, {"path": pick_folder()})
                 elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and store.get(parts[2]):
