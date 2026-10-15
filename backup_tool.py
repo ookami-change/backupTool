@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""BackupTool - 本地目录定时备份小工具（零依赖，仅需 Python 3.8+）。
+"""BackupTool - 本地目录定时备份到腾讯云 COS 的小工具（零依赖，仅需 Python 3.8+）。
 
 用法:
     python3 backup_tool.py                 启动服务并打开浏览器管理界面
     python3 backup_tool.py --no-browser    仅启动服务
     python3 backup_tool.py run-once        立即执行所有已启用任务后退出
     python3 backup_tool.py install-autostart / uninstall-autostart   (macOS) 登录时自动启动
-
-可选：备份完成后上传到腾讯云 COS 存储桶（在管理界面「腾讯云 COS 设置」中配置）。
 """
 import argparse
 import fnmatch
@@ -18,27 +16,28 @@ import logging
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
-import uuid
-import webbrowser
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import webbrowser
 import xml.etree.ElementTree as ET
-import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_DIR = Path(os.environ.get("BACKUP_TOOL_HOME", Path.home() / ".backup_tool"))
 CONFIG_FILE = APP_DIR / "config.json"
+MANIFEST_DIR = APP_DIR / "manifests"
 LOG_FILE = APP_DIR / "backup.log"
 DEFAULT_PORT = 8765
-TS_FORMAT = "%Y%m%d-%H%M%S"
+DEFAULT_INTERVAL = 120
+UPLOAD_WORKERS = 4
 LAUNCHD_LABEL = "com.backuptool.agent"
 COS_FIELDS = ("secret_id", "secret_key", "bucket", "region", "prefix")
 
@@ -48,7 +47,7 @@ log = logging.getLogger("backup_tool")
 # ---------------------------------------------------------------- config
 
 class Store:
-    """线程安全的任务配置存储。"""
+    """线程安全的任务与 COS 配置存储。"""
 
     def __init__(self, path=CONFIG_FILE):
         self.path = Path(path)
@@ -63,6 +62,12 @@ class Store:
                 data = json.loads(self.path.read_text("utf-8"))
                 self.tasks = data.get("tasks", [])
                 self.cos = data.get("cos", {})
+            for t in self.tasks:  # 兼容旧版单目录任务
+                if "sources" not in t:
+                    t["sources"] = [t["source"]] if t.get("source") else []
+                for k in ("source", "dest", "mode", "keep", "upload_cos"):
+                    t.pop(k, None)
+                t.setdefault("delete_remote", False)
 
     def save(self):
         with self.lock:
@@ -72,6 +77,43 @@ class Store:
                                       ensure_ascii=False, indent=2), "utf-8")
             os.chmod(tmp, 0o600)  # 含 COS 密钥，仅本人可读
             tmp.replace(self.path)
+
+    def get(self, task_id):
+        with self.lock:
+            return next((t for t in self.tasks if t["id"] == task_id), None)
+
+    def upsert(self, data, task_id=None):
+        task = validate_task(data)
+        with self.lock:
+            if any(t["name"] == task["name"] and t["id"] != task_id for t in self.tasks):
+                raise ValueError(f"任务名称「{task['name']}」已存在（任务名称用作 COS 上的目录名）")
+            existing = self.get(task_id) if task_id else None
+            if existing:
+                existing.update(task)
+                task = existing
+            else:
+                task.update(id=uuid.uuid4().hex[:8], last_run=None, last_status=None,
+                            last_message="", running=False)
+                self.tasks.append(task)
+            self.save()
+            return dict(task)
+
+    def delete(self, task_id):
+        with self.lock:
+            self.tasks = [t for t in self.tasks if t["id"] != task_id]
+            self.save()
+        manifest_path(task_id).unlink(missing_ok=True)
+
+    def update_status(self, task_id, **fields):
+        with self.lock:
+            task = self.get(task_id)
+            if task:
+                task.update(fields)
+                self.save()
+
+    def snapshot(self):
+        with self.lock:
+            return [dict(t, sources=list(t["sources"])) for t in self.tasks]
 
     def cos_config(self):
         """实际生效的 COS 配置，密钥可由环境变量 COS_SECRET_ID / COS_SECRET_KEY 提供。"""
@@ -97,194 +139,49 @@ class Store:
             self.cos = cfg
             self.save()
 
-    def get(self, task_id):
-        with self.lock:
-            return next((t for t in self.tasks if t["id"] == task_id), None)
 
-    def upsert(self, data, task_id=None):
-        task = validate_task(data)
-        with self.lock:
-            existing = self.get(task_id) if task_id else None
-            if existing:
-                existing.update(task)
-                task = existing
-            else:
-                task.update(id=uuid.uuid4().hex[:8], last_run=None, last_status=None,
-                            last_message="", running=False)
-                self.tasks.append(task)
-            self.save()
-            return dict(task)
-
-    def delete(self, task_id):
-        with self.lock:
-            self.tasks = [t for t in self.tasks if t["id"] != task_id]
-            self.save()
-
-    def update_status(self, task_id, **fields):
-        with self.lock:
-            task = self.get(task_id)
-            if task:
-                task.update(fields)
-                self.save()
-
-    def snapshot(self):
-        with self.lock:
-            return [dict(t) for t in self.tasks]
+def source_dir_name(source):
+    return Path(source).name or "root"
 
 
 def validate_task(data):
-    source = Path(str(data.get("source", "")).strip()).expanduser()
-    dest = Path(str(data.get("dest", "")).strip()).expanduser()
-    if not str(data.get("source", "")).strip() or not source.is_dir():
-        raise ValueError(f"源目录不存在: {source}")
-    if not str(data.get("dest", "")).strip():
-        raise ValueError("请填写备份目标目录")
-    source, dest = source.resolve(), dest.resolve()
-    if source == dest:
-        raise ValueError("源目录和目标目录不能相同")
-    interval = int(data.get("interval_minutes") or 60)
-    keep = int(data.get("keep") or 10)
-    mode = data.get("mode", "snapshot")
+    raw = data.get("sources") or []
+    if isinstance(raw, str):
+        raw = raw.splitlines()
+    sources = []
+    for s in raw:
+        s = str(s).strip()
+        if not s:
+            continue
+        p = Path(s).expanduser()
+        if not p.is_dir():
+            raise ValueError(f"目录不存在: {p}")
+        p = str(p.resolve())
+        if p not in sources:
+            sources.append(p)
+    if not sources:
+        raise ValueError("请至少选择一个要备份的目录")
+    names = [source_dir_name(s) for s in sources]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise ValueError(f"目录名重复：{'、'.join(dup)}（同名目录会在 COS 上互相覆盖，请拆成不同任务）")
+    name = str(data.get("name") or "").strip().strip("/") or names[0]
+    if "/" in name:
+        raise ValueError("任务名称不能包含 /")
+    interval = int(data.get("interval_minutes") or DEFAULT_INTERVAL)
     if interval < 1:
         raise ValueError("备份间隔至少 1 分钟")
-    if keep < 1:
-        raise ValueError("保留份数至少 1")
-    if mode not in ("snapshot", "zip"):
-        raise ValueError("备份方式只能是 snapshot 或 zip")
     excludes = data.get("excludes", "")
     if isinstance(excludes, list):
         excludes = ",".join(excludes)
     return {
-        "name": str(data.get("name") or source.name).strip(),
-        "source": str(source),
-        "dest": str(dest),
+        "name": name,
+        "sources": sources,
         "interval_minutes": interval,
-        "keep": keep,
-        "mode": mode,
         "excludes": ",".join(p.strip() for p in str(excludes).split(",") if p.strip()),
+        "delete_remote": bool(data.get("delete_remote", False)),
         "enabled": bool(data.get("enabled", True)),
-        "upload_cos": bool(data.get("upload_cos", False)),
     }
-
-
-# ---------------------------------------------------------------- backup engine
-
-def _excluded(name, patterns):
-    return any(fnmatch.fnmatch(name, p) for p in patterns)
-
-
-def iter_files(source, patterns, skip_dir=None):
-    """遍历源目录，返回 (绝对路径, 相对路径)；跳过排除项及位于源目录内的备份目标。"""
-    for root, dirs, files in os.walk(source):
-        root_path = Path(root)
-        dirs[:] = [d for d in dirs
-                   if not _excluded(d, patterns)
-                   and (skip_dir is None or (root_path / d).resolve() != skip_dir)]
-        for f in files:
-            if _excluded(f, patterns):
-                continue
-            full = root_path / f
-            if full.is_symlink() or not full.is_file():
-                continue
-            yield full, full.relative_to(source)
-
-
-def _snapshot_name(existing):
-    """生成新备份名，保证排序在已有备份之后（同一秒内追加 -2、-3 ...）。"""
-    ts = datetime.now().strftime(TS_FORMAT)
-    last = _backup_sort_key(existing[-1]) if existing else None
-    n = 1
-    while last is not None and (ts, n) <= last:
-        n += 1
-    return ts if n == 1 else f"{ts}-{n}"
-
-
-def task_backup_root(task):
-    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in task["name"]) or "backup"
-    return Path(task["dest"]) / f"{safe}-{task['id']}"
-
-
-def list_backups(task):
-    root = task_backup_root(task)
-    if not root.exists():
-        return []
-    items = [p for p in root.iterdir()
-             if not p.name.startswith(".") and (p.is_dir() or p.suffix == ".zip")]
-    return sorted(items, key=_backup_sort_key)
-
-
-def _backup_sort_key(p):
-    # 名称形如 20261015-120000 或同一秒内的 20261015-120000-2
-    stem = p.name[:-4] if p.name.endswith(".zip") else p.name
-    ts, _, n = stem[:15], stem[15:16], stem[16:]
-    return ts, int(n) if n.isdigit() else 1
-
-
-def run_backup(task):
-    """执行一次备份，返回 (文件数, 新拷贝数, 输出路径)。
-
-    snapshot 模式: 每次生成一个完整目录快照，未变化的文件与上一份快照做硬链接，
-    只占用变化文件的空间（类似 rsync --link-dest / Time Machine）。
-    zip 模式: 每次生成一个 zip 压缩包。
-    """
-    source = Path(task["source"])
-    if not source.is_dir():
-        raise FileNotFoundError(f"源目录不存在: {source}")
-    root = task_backup_root(task)
-    root.mkdir(parents=True, exist_ok=True)
-    patterns = [p for p in task.get("excludes", "").split(",") if p]
-    skip = root.resolve()
-    existing = list_backups(task)
-    name = _snapshot_name(existing)
-    previous = [p for p in existing if p.is_dir()]
-    prev = previous[-1] if previous else None
-    total = copied = 0
-
-    if task["mode"] == "zip":
-        out = root / f"{name}.zip"
-        tmp = root / f".{name}.zip.part"
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as zf:
-            for full, rel in iter_files(source, patterns, skip):
-                zf.write(full, rel.as_posix())
-                total += 1
-        tmp.replace(out)
-        copied = total
-    else:
-        out = root / name
-        tmp = root / f".{name}.part"
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        for full, rel in iter_files(source, patterns, skip):
-            target = tmp / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            total += 1
-            st = full.stat()
-            if prev is not None:
-                old = prev / rel
-                try:
-                    ost = old.stat()
-                    if ost.st_size == st.st_size and int(ost.st_mtime) == int(st.st_mtime):
-                        os.link(old, target)
-                        continue
-                except OSError:
-                    pass
-            shutil.copy2(full, target)
-            copied += 1
-        tmp.mkdir(parents=True, exist_ok=True)
-        tmp.rename(out)
-
-    prune(task)
-    return total, copied, out
-
-
-def prune(task):
-    backups = list_backups(task)
-    for old in backups[:-task["keep"]] if len(backups) > task["keep"] else []:
-        log.info("[%s] 清理旧备份 %s", task["name"], old)
-        if old.is_dir():
-            shutil.rmtree(old, ignore_errors=True)
-        else:
-            old.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- tencent cos
@@ -377,55 +274,120 @@ class CosClient:
             marker = nxt[0] if nxt and nxt[0] else page[-1]
 
 
-def cos_remote_root(cfg, task):
-    parts = [cfg.get("prefix", "").strip("/"), task_backup_root(task).name]
+# ---------------------------------------------------------------- sync engine
+
+def _excluded(name, patterns):
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
+
+
+def iter_files(source, patterns):
+    """遍历目录，返回 (绝对路径, 相对路径)；跳过排除项和符号链接。"""
+    for root, dirs, files in os.walk(source):
+        dirs[:] = [d for d in dirs if not _excluded(d, patterns)]
+        root_path = Path(root)
+        for f in files:
+            if _excluded(f, patterns):
+                continue
+            full = root_path / f
+            if full.is_symlink() or not full.is_file():
+                continue
+            yield full, full.relative_to(source)
+
+
+def remote_root(cfg, task):
+    parts = [cfg.get("prefix", "").strip("/"), task["name"]]
     return "/".join(p for p in parts if p) + "/"
 
 
-def upload_to_cos(cfg, task, out):
-    """把本次备份上传到 COS，返回结果描述。
+def manifest_path(task_id):
+    return MANIFEST_DIR / f"{task_id}.json"
 
-    zip 模式: 上传压缩包，远端同样只保留最近 keep 份。
-    snapshot 模式: 把最新快照增量同步到 <前缀>/<任务>/latest/，只传有变化的文件并删除已不存在的文件。
+
+def sync_task(cfg, task, progress=None):
+    """把任务的所有目录增量同步到 COS：<前缀>/<任务名>/<目录名>/<相对路径>。
+
+    本地记录每个已上传文件的 (大小, 修改时间)，只上传新增或有变化的文件。
+    返回 (文件总数, 上传数, 删除数, 错误列表)。
     """
     client = CosClient(cfg)
-    remote = cos_remote_root(cfg, task)
-    if out.is_file():
-        client.put_file(remote + out.name, out)
-        zips = sorted((k for k in client.list_keys(remote)
-                       if k.endswith(".zip") and "/" not in k[len(remote):]),
-                      key=lambda k: _backup_sort_key(Path(k)))
-        removed = zips[:-task["keep"]] if len(zips) > task["keep"] else []
-        for k in removed:
-            client.delete(k)
-        return f"已上传 COS：{remote}{out.name}" + (f"，清理远端旧备份 {len(removed)} 个" if removed else "")
-
-    latest = remote + "latest/"
-    manifest_file = task_backup_root(task) / ".cos_manifest.json"
-    target = f"{cfg['bucket']}/{latest}"
+    root = remote_root(cfg, task)
+    target = f"{cfg['bucket']}/{root}"
+    mpath = manifest_path(task["id"])
     manifest = {}
-    if manifest_file.exists():
-        saved = json.loads(manifest_file.read_text("utf-8"))
+    if mpath.exists():
+        saved = json.loads(mpath.read_text("utf-8"))
         if saved.get("target") == target:
             manifest = saved.get("files", {})
-    files = {rel.as_posix(): full for full, rel in iter_files(out, [])}
-    uploaded = deleted = 0
-    try:
-        for rel, full in files.items():
+
+    patterns = [p for p in task.get("excludes", "").split(",") if p]
+    errors = []
+    current = {}      # 远端相对 key -> 本地路径
+    scanned = set()   # 成功扫描的目录；扫描失败（如移动硬盘未接入）的目录不做删除判断
+    configured = {source_dir_name(s) for s in task["sources"]}
+    for src in task["sources"]:
+        if not Path(src).is_dir():
+            errors.append(f"目录不存在，已跳过: {src}")
+            continue
+        base = source_dir_name(src)
+        for full, rel in iter_files(Path(src), patterns):
+            current[f"{base}/{rel.as_posix()}"] = full
+        scanned.add(base)
+
+    todo = []
+    for key, full in current.items():
+        try:
             st = full.stat()
-            sig = [st.st_size, int(st.st_mtime)]
-            if manifest.get(rel) == sig:
-                continue
-            client.put_file(latest + rel, full)
-            manifest[rel] = sig
-            uploaded += 1
-        for rel in [r for r in manifest if r not in files]:
-            client.delete(latest + rel)
-            manifest.pop(rel)
-            deleted += 1
-    finally:  # 中途失败也记录已上传的部分，下次续传
-        manifest_file.write_text(json.dumps({"target": target, "files": manifest}), "utf-8")
-    return f"COS 同步到 {latest}：上传 {uploaded} 个，删除 {deleted} 个"
+        except OSError as e:
+            errors.append(f"{full}: {e}")
+            continue
+        sig = [st.st_size, int(st.st_mtime)]
+        if manifest.get(key) != sig:
+            todo.append((key, full, sig))
+
+    lock = threading.Lock()
+    state = {"done": 0, "saved_at": time.time()}
+
+    def save_manifest():
+        MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+        mpath.write_text(json.dumps({"target": target, "files": manifest}, ensure_ascii=False), "utf-8")
+
+    def upload(item):
+        key, full, sig = item
+        client.put_file(root + key, full)
+        with lock:
+            manifest[key] = sig
+            state["done"] += 1
+            if time.time() - state["saved_at"] > 5:  # 定期落盘，中断后可续传
+                save_manifest()
+                state["saved_at"] = time.time()
+                if progress:
+                    progress(state["done"], len(todo))
+
+    deleted = 0
+    try:
+        with ThreadPoolExecutor(UPLOAD_WORKERS) as pool:
+            futures = [(pool.submit(upload, item), item) for item in todo]
+            for fut, item in futures:
+                try:
+                    fut.result()
+                except Exception as e:  # noqa: BLE001 - 单个文件失败不影响其他文件
+                    errors.append(f"{item[1]}: {e}")
+        # 本地已删除的文件，以及已从任务中移除的目录下的文件
+        gone = [k for k in manifest
+                if (k not in current and k.split("/", 1)[0] in scanned)
+                or k.split("/", 1)[0] not in configured]
+        for key in gone:
+            if task.get("delete_remote"):
+                try:
+                    client.delete(root + key)
+                    deleted += 1
+                except RuntimeError as e:
+                    errors.append(str(e))
+                    continue
+            manifest.pop(key)
+    finally:
+        save_manifest()
+    return len(current), state["done"], deleted, errors
 
 
 # ---------------------------------------------------------------- scheduler
@@ -461,20 +423,24 @@ class Scheduler:
         try:
             if not task:
                 return
-            task = dict(task)
-            self.store.update_status(task_id, running=True)
+            task = dict(task, sources=list(task["sources"]))
+            self.store.update_status(task_id, running=True, last_message="正在扫描目录…")
+            cfg = self.store.cos_config()
+            if not cos_configured(cfg):
+                raise RuntimeError("尚未配置腾讯云 COS，请先在「腾讯云 COS 设置」中填写")
             started = time.time()
-            log.info("[%s] 开始备份 %s -> %s", task["name"], task["source"], task["dest"])
-            total, copied, out = run_backup(task)
-            msg = f"{total} 个文件，新复制 {copied} 个，耗时 {time.time() - started:.1f}s -> {out.name}"
-            if task.get("upload_cos"):
-                cfg = self.store.cos_config()
-                if not cos_configured(cfg):
-                    raise RuntimeError(f"本地备份完成（{msg}），但尚未配置腾讯云 COS")
-                try:
-                    msg += "；" + upload_to_cos(cfg, task, out)
-                except Exception as e:
-                    raise RuntimeError(f"本地备份完成（{msg}），上传 COS 失败: {e}") from e
+            log.info("[%s] 开始备份 %s -> cos://%s/%s", task["name"], ", ".join(task["sources"]),
+                     cfg["bucket"], remote_root(cfg, task))
+            total, uploaded, deleted, errors = sync_task(
+                cfg, task, lambda n, m: self.store.update_status(task_id, last_message=f"正在上传 {n}/{m}…"))
+            msg = f"{total} 个文件，上传 {uploaded} 个"
+            if deleted:
+                msg += f"，删除远端 {deleted} 个"
+            msg += f"，耗时 {time.time() - started:.1f}s"
+            if errors:
+                for e in errors:
+                    log.error("[%s] %s", task["name"], e)
+                raise RuntimeError(f"{msg}；{len(errors)} 个错误，例如：{errors[0]}")
             log.info("[%s] 备份完成：%s", task["name"], msg)
             self.store.update_status(task_id, last_status="ok", last_message=msg)
         except Exception as e:  # noqa: BLE001 - 记录任何失败
@@ -499,28 +465,29 @@ class Scheduler:
 
 # ---------------------------------------------------------------- folder picker
 
-def pick_folder():
+def pick_folders():
+    """弹出系统目录选择框（支持多选），返回路径列表；无法弹出时返回 None。"""
     system = platform.system()
     try:
         if system == "Darwin":
-            r = subprocess.run(["osascript", "-e",
-                                'POSIX path of (choose folder with prompt "选择目录")'],
-                               capture_output=True, text=True, timeout=300)
+            script = ('set fs to choose folder with prompt "选择要备份的目录（可按住 ⌘ 多选）" '
+                      'with multiple selections allowed\n'
+                      'set out to ""\n'
+                      'repeat with f in fs\n set out to out & POSIX path of f & linefeed\nend repeat\n'
+                      'return out')
+            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=600)
         elif system == "Windows":
             ps = ("Add-Type -AssemblyName System.Windows.Forms;"
                   "$d=New-Object System.Windows.Forms.FolderBrowserDialog;"
                   "if($d.ShowDialog() -eq 'OK'){$d.SelectedPath}")
             r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                               capture_output=True, text=True, timeout=300)
+                               capture_output=True, text=True, timeout=600)
         else:
-            r = subprocess.run(["zenity", "--file-selection", "--directory"],
-                               capture_output=True, text=True, timeout=300)
+            r = subprocess.run(["zenity", "--file-selection", "--directory", "--multiple",
+                                "--separator=\n"], capture_output=True, text=True, timeout=600)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
-    path = r.stdout.strip()
-    if not path:
-        return None
-    return path.rstrip("/") or "/"
+    return [p.rstrip("/") or "/" for p in r.stdout.splitlines() if p.strip()]
 
 
 # ---------------------------------------------------------------- web ui
@@ -533,43 +500,33 @@ INDEX_HTML = r"""<!doctype html>
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1f2328;--muted:#656d76;--line:#d0d7de;--accent:#2563eb;--ok:#16a34a;--err:#dc2626}
 @media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--muted:#8d96a0;--line:#30363d;--accent:#4f8cff}}
 *{box-sizing:border-box}body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:var(--bg);color:var(--fg)}
+a{color:var(--accent)}
 .wrap{max-width:960px;margin:0 auto;padding:24px 16px}h1{font-size:22px;margin:0 0 4px}.sub{color:var(--muted);margin-bottom:20px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
 label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
-input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
-.row{display:flex;gap:8px}.row>*{flex:1}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-@media (max-width:640px){.grid{grid-template-columns:1fr 1fr}}
+input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
+.row{display:flex;gap:8px}.row>input{flex:1;min-width:0}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+@media (max-width:640px){.grid{grid-template-columns:1fr}}
 button{padding:8px 14px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer;font:inherit;white-space:nowrap}
 button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.danger{color:var(--err)}
+button.link{border:0;background:none;padding:0 4px;color:var(--err)}
 button:disabled{opacity:.5;cursor:default}.actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
 .task{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
 .task h3{margin:0 0 4px;font-size:16px}.meta{color:var(--muted);font-size:12px;word-break:break-all}
-.badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;border:1px solid var(--line);margin-left:6px}
+.badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;border:1px solid var(--line);margin-left:6px;font-weight:normal}
 .ok{color:var(--ok)}.error{color:var(--err)}.msg{margin-top:6px;font-size:12px}
-#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:8px 16px;border-radius:6px;display:none}
+.dirs{border:1px solid var(--line);border-radius:6px;background:var(--bg);margin-bottom:8px}
+.dirs div{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 10px;border-top:1px solid var(--line);word-break:break-all}
+.dirs div:first-child{border-top:0}.dirs .empty{color:var(--muted)}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:8px 16px;border-radius:6px;display:none;max-width:90vw}
 .check{display:flex;align-items:center;gap:6px;margin-top:10px}.check input{width:auto}
+summary{cursor:pointer;font-size:16px;font-weight:600}
 </style></head><body><div class="wrap">
-<h1>BackupTool</h1><div class="sub">选择本地目录，按间隔自动备份。服务运行期间会自动执行到期任务。</div>
-<div class="card"><h2 id="formTitle" style="font-size:16px;margin:0">新建备份任务</h2>
-<form id="form"><input type="hidden" id="tid">
-<label>任务名称</label><input id="name" placeholder="默认使用源目录名">
-<label>源目录（要备份的目录）</label><div class="row"><input id="source" required><button type="button" style="flex:0" onclick="pick('source')">选择…</button></div>
-<label>目标目录（备份存放位置）</label><div class="row"><input id="dest" required><button type="button" style="flex:0" onclick="pick('dest')">选择…</button></div>
-<div class="grid">
-<div><label>备份间隔（分钟）</label><input id="interval_minutes" type="number" min="1" value="60"></div>
-<div><label>保留份数</label><input id="keep" type="number" min="1" value="10"></div>
-<div><label>备份方式</label><select id="mode"><option value="snapshot">目录快照（增量硬链接）</option><option value="zip">ZIP 压缩包</option></select></div>
-<div><label>排除（逗号分隔）</label><input id="excludes" placeholder=".git,node_modules,*.tmp"></div>
-</div>
-<div class="check"><input type="checkbox" id="enabled" checked><span>启用定时备份</span></div>
-<div class="check"><input type="checkbox" id="upload_cos"><span>备份后上传到腾讯云 COS <span class="meta" id="cosHint"></span></span></div>
-<div class="actions"><button class="primary" type="submit">保存</button><button type="button" onclick="resetForm()">清空</button></div>
-</form></div>
-<div id="list"></div>
-<details class="card" id="cosCard"><summary style="cursor:pointer;font-size:16px;font-weight:600">腾讯云 COS 设置 <span class="badge" id="cosState">未配置</span></summary>
+<h1>BackupTool</h1><div class="sub">选择本地目录，按间隔自动增量上传到腾讯云 COS。服务运行期间会自动执行到期任务。</div>
+<details class="card" id="cosCard"><summary>腾讯云 COS 设置 <span class="badge" id="cosState">未配置</span></summary>
 <form id="cosForm">
 <div class="meta" style="margin-top:8px">密钥在 <a href="https://console.cloud.tencent.com/cam/capi" target="_blank">访问管理 → API 密钥</a> 获取，建议使用只授权该存储桶的子账号密钥。密钥只保存在本机 ~/.backup_tool/config.json。</div>
-<div class="grid" style="grid-template-columns:1fr 1fr">
+<div class="grid">
 <div><label>SecretId</label><input id="cos_secret_id" autocomplete="off"></div>
 <div><label>SecretKey</label><input id="cos_secret_key" type="password" autocomplete="new-password"></div>
 <div><label>存储桶名称（含 APPID）</label><input id="cos_bucket" placeholder="examplebucket-1250000000"></div>
@@ -578,40 +535,56 @@ button:disabled{opacity:.5;cursor:default}.actions{display:flex;gap:8px;margin-t
 <label>路径前缀（可选）</label><input id="cos_prefix" placeholder="backups">
 <div class="actions"><button class="primary" type="submit">保存</button><button type="button" onclick="testCos()">测试连接</button></div>
 </form></details>
-</div><div id="toast"></div>
+<div class="card"><h2 id="formTitle" style="font-size:16px;margin:0">新建备份任务</h2>
+<form id="form"><input type="hidden" id="tid">
+<label>要备份的目录</label><div class="dirs" id="dirs"></div>
+<div class="row"><input id="manualDir" placeholder="也可手动输入路径后点「添加」"><button type="button" onclick="addManual()">添加</button><button type="button" class="primary" onclick="pick()">选择目录…</button></div>
+<div class="grid">
+<div><label>任务名称（COS 上的目录名）</label><input id="name" placeholder="默认使用第一个目录名"></div>
+<div><label>备份间隔（分钟）</label><input id="interval_minutes" type="number" min="1" value="120"></div>
+</div>
+<label>排除（逗号分隔）</label><input id="excludes" placeholder=".git,node_modules,*.tmp,.DS_Store">
+<div class="check"><input type="checkbox" id="delete_remote"><span>本地删除的文件也从 COS 删除（不勾选则 COS 上保留）</span></div>
+<div class="check"><input type="checkbox" id="enabled" checked><span>启用定时备份</span></div>
+<div class="actions"><button class="primary" type="submit">保存</button><button type="button" onclick="resetForm()">清空</button></div>
+</form></div>
+<div id="list"></div></div><div id="toast"></div>
 <script>
-const $=id=>document.getElementById(id);const F=['name','source','dest','interval_minutes','keep','mode','excludes'];
-function toast(t){const e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(e._t);e._t=setTimeout(()=>e.style.display='none',2500)}
+const $=id=>document.getElementById(id);const F=['name','interval_minutes','excludes'];let dirs=[];
+function toast(t,ms){const e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(e._t);e._t=setTimeout(()=>e.style.display='none',ms||3000)}
 async function api(path,opt={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||r.statusText);return j}
-async function pick(f){try{const j=await api('/api/pick-folder',{method:'POST'});if(j.path)$(f).value=j.path}catch(e){toast('无法打开选择框，请手动输入路径')}}
-function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function renderDirs(){$('dirs').innerHTML=dirs.length?dirs.map((d,i)=>`<div><span>${esc(d)}</span><button type="button" class="link" onclick="dirs.splice(${i},1);renderDirs()">移除</button></div>`).join(''):'<div class="empty">还没有选择目录（选择框里按住 ⌘ 可多选）</div>'}
+function addDirs(list){list.forEach(d=>{d=d.trim();if(d&&!dirs.includes(d))dirs.push(d)});renderDirs()}
+function addManual(){addDirs([$('manualDir').value]);$('manualDir').value=''}
+async function pick(){try{const j=await api('/api/pick-folders',{method:'POST'});if(j.paths)addDirs(j.paths);else toast('无法打开选择框，请手动输入路径')}catch(e){toast(e.message)}}
 let tasks=[];
 async function load(){tasks=(await api('/api/tasks')).tasks;render()}
 function render(){$('list').innerHTML=tasks.length?tasks.map(t=>{
  const st=t.running?'<span class="badge">备份中…</span>':t.last_status==='ok'?'<span class="badge ok">成功</span>':t.last_status==='error'?'<span class="badge error">失败</span>':'';
  const next=t.enabled?(t.next_run?'下次：'+t.next_run.replace('T',' '):'即将执行'):'已暂停';
  return `<div class="card task"><div style="flex:1;min-width:260px"><h3>${esc(t.name)}${st}</h3>
- <div class="meta">${esc(t.source)} → ${esc(t.dest)}</div>
- <div class="meta">每 ${t.interval_minutes} 分钟 · 保留 ${t.keep} 份 · ${t.mode==='zip'?'ZIP':'快照'} · 已有 ${t.backup_count} 份${t.upload_cos?' · 上传 COS':''} · 上次：${t.last_run?t.last_run.replace('T',' '):'从未'} · ${next}</div>
- ${t.last_message?`<div class="msg ${t.last_status}">${esc(t.last_message)}</div>`:''}</div>
+ ${t.sources.map(s=>`<div class="meta">${esc(s)}</div>`).join('')}
+ <div class="meta" style="margin-top:4px">→ cos://${esc(t.remote)} · 每 ${t.interval_minutes} 分钟${t.delete_remote?' · 同步删除':''} · 上次：${t.last_run?t.last_run.replace('T',' '):'从未'} · ${next}</div>
+ ${t.last_message?`<div class="msg ${t.running?'':t.last_status}">${esc(t.last_message)}</div>`:''}</div>
  <div class="actions" style="margin:0"><button class="primary" ${t.running?'disabled':''} onclick="run('${t.id}')">立即备份</button>
- <button onclick="openDir('${t.id}')">打开</button><button onclick="edit('${t.id}')">编辑</button>
- <button class="danger" onclick="del('${t.id}')">删除</button></div></div>`}).join(''):'<div class="card meta">还没有备份任务</div>'}
-function edit(id){const t=tasks.find(x=>x.id===id);$('tid').value=id;F.forEach(f=>$(f).value=t[f]);$('enabled').checked=t.enabled;$('upload_cos').checked=!!t.upload_cos;$('formTitle').textContent='编辑任务：'+t.name;scrollTo(0,0)}
-function resetForm(){$('form').reset();$('tid').value='';$('formTitle').textContent='新建备份任务'}
-$('form').onsubmit=async e=>{e.preventDefault();const body={enabled:$('enabled').checked,upload_cos:$('upload_cos').checked};F.forEach(f=>body[f]=$(f).value);const id=$('tid').value;
- try{await api(id?'/api/tasks/'+id:'/api/tasks',{method:id?'PUT':'POST',body:JSON.stringify(body)});toast('已保存');resetForm();load()}catch(err){toast(err.message)}}
+ <button onclick="edit('${t.id}')">编辑</button><button class="danger" onclick="del('${t.id}')">删除</button></div></div>`}).join(''):'<div class="card meta">还没有备份任务</div>'}
+function edit(id){const t=tasks.find(x=>x.id===id);$('tid').value=id;F.forEach(f=>$(f).value=t[f]);dirs=[...t.sources];renderDirs();
+ $('enabled').checked=t.enabled;$('delete_remote').checked=!!t.delete_remote;$('formTitle').textContent='编辑任务：'+t.name;scrollTo(0,0)}
+function resetForm(){$('form').reset();$('tid').value='';dirs=[];renderDirs();$('formTitle').textContent='新建备份任务'}
+$('form').onsubmit=async e=>{e.preventDefault();if($('manualDir').value.trim())addManual();
+ const body={sources:dirs,enabled:$('enabled').checked,delete_remote:$('delete_remote').checked};F.forEach(f=>body[f]=$(f).value);const id=$('tid').value;
+ try{await api(id?'/api/tasks/'+id:'/api/tasks',{method:id?'PUT':'POST',body:JSON.stringify(body)});toast('已保存');resetForm();load()}catch(err){toast(err.message,5000)}}
 async function run(id){try{await api(`/api/tasks/${id}/run`,{method:'POST'});toast('已开始备份');setTimeout(load,500)}catch(e){toast(e.message)}}
-async function openDir(id){try{await api(`/api/tasks/${id}/open`,{method:'POST'})}catch(e){toast(e.message)}}
-async function del(id){if(!confirm('删除任务？（已有备份文件不会被删除）'))return;await api('/api/tasks/'+id,{method:'DELETE'});load()}
+async function del(id){if(!confirm('删除任务？（COS 上已上传的文件不会被删除）'))return;await api('/api/tasks/'+id,{method:'DELETE'});load()}
 const C=['secret_id','bucket','region','prefix'];
 async function loadCos(){const c=await api('/api/cos');C.forEach(f=>$('cos_'+f).value=c[f]);$('cos_secret_key').value='';
  $('cos_secret_key').placeholder=c.has_secret_key?'已保存，留空则不修改':'';$('cosState').textContent=c.configured?c.bucket:'未配置';
- $('cosState').className='badge'+(c.configured?' ok':'');$('cosHint').textContent=c.configured?'':'（请先在页面底部配置 COS）'}
+ $('cosState').className='badge'+(c.configured?' ok':' error');if(!c.configured)$('cosCard').open=true}
 $('cosForm').onsubmit=async e=>{e.preventDefault();const body={secret_key:$('cos_secret_key').value};C.forEach(f=>body[f]=$('cos_'+f).value);
- try{await api('/api/cos',{method:'POST',body:JSON.stringify(body)});toast('COS 设置已保存');loadCos()}catch(err){toast(err.message)}}
-async function testCos(){toast('正在连接…');try{await api('/api/cos/test',{method:'POST'});toast('连接成功')}catch(e){toast(e.message)}}
-load();loadCos();setInterval(load,3000);
+ try{await api('/api/cos',{method:'POST',body:JSON.stringify(body)});toast('COS 设置已保存');loadCos();load()}catch(err){toast(err.message)}}
+async function testCos(){toast('正在连接…');try{await api('/api/cos/test',{method:'POST'});toast('连接成功')}catch(e){toast(e.message,6000)}}
+renderDirs();load();loadCos();setInterval(load,3000);
 </script></body></html>"""
 
 
@@ -654,9 +627,10 @@ def make_handler(store, scheduler):
                 self.end_headers()
                 self.wfile.write(body)
             elif parts == ["api", "tasks"]:
+                cfg = store.cos_config()
                 tasks = store.snapshot()
                 for t in tasks:
-                    t["backup_count"] = len(list_backups(t))
+                    t["remote"] = f"{cfg.get('bucket') or '<未配置>'}/{remote_root(cfg, t)}"
                     if t.get("last_run"):
                         nxt = datetime.fromisoformat(t["last_run"]).timestamp() + t["interval_minutes"] * 60
                         t["next_run"] = datetime.fromtimestamp(nxt).isoformat(timespec="seconds")
@@ -685,21 +659,13 @@ def make_handler(store, scheduler):
                     except RuntimeError as e:
                         raise ValueError(str(e)) from None
                     self._json(200, {"ok": True})
-                elif parts == ["api", "pick-folder"]:
-                    self._json(200, {"path": pick_folder()})
-                elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and store.get(parts[2]):
-                    if parts[3] == "run":
-                        started = scheduler.trigger(parts[2])
-                        self._json(200 if started else 409,
-                                   {"ok": True} if started else {"error": "该任务正在备份中"})
-                    elif parts[3] == "open":
-                        root = task_backup_root(store.get(parts[2]))
-                        root.mkdir(parents=True, exist_ok=True)
-                        opener = {"Darwin": "open", "Windows": "explorer"}.get(platform.system(), "xdg-open")
-                        subprocess.Popen([opener, str(root)])
-                        self._json(200, {"ok": True})
-                    else:
-                        self._json(404, {"error": "not found"})
+                elif parts == ["api", "pick-folders"]:
+                    self._json(200, {"paths": pick_folders()})
+                elif len(parts) == 4 and parts[:2] == ["api", "tasks"] and parts[3] == "run" \
+                        and store.get(parts[2]):
+                    started = scheduler.trigger(parts[2])
+                    self._json(200 if started else 409,
+                               {"ok": True} if started else {"error": "该任务正在备份中"})
                 else:
                     self._json(404, {"error": "not found"})
             except (ValueError, TypeError) as e:
@@ -778,7 +744,7 @@ def setup_logging():
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="本地目录定时备份小工具")
+    parser = argparse.ArgumentParser(description="本地目录定时备份到腾讯云 COS")
     parser.add_argument("command", nargs="?", default="serve",
                         choices=["serve", "run-once", "install-autostart", "uninstall-autostart"])
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
