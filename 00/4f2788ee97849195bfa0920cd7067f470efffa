@@ -1,0 +1,23 @@
+.gitignore
+  s_96bd648647f40d::t_604e9fb8e7c938 1-3
+backup_tool.py
+  s_96bd648647f40d::t_f25404746d2255 1-594
+README.md
+  s_96bd648647f40d::t_1d408e3a31dd44 1-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.6",
+  "base_commit_sha": "004f2788ee97849195bfa0920cd7067f470efffa",
+  "prompts": {},
+  "sessions": {
+    "s_96bd648647f40d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "85eae89e-919b-474d-a208-a03ba3d1fd1c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "ookami-change <ihgr7523@outlook.com>"
+    }
+  }
+}
